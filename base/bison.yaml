@@ -1,0 +1,114 @@
+schema: 1
+name: bison
+version: "3.8.2"
+revision: 1
+description: "GNU general-purpose parser generator"
+license: GPL-3.0-or-later
+
+source:
+  - uri: https://ftpmirror.gnu.org/bison/bison-3.8.2.tar.xz
+    sha256: 9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2
+    strip_components: 1
+
+build:
+  environment:
+    packages:
+      - pkg:bbi
+      - pkg:gettext
+      - pkg:texinfo
+      - pkg:m4
+      - pkg:autoconf
+      - pkg:gperf
+      - pkg:glibc-iconv
+
+  pipeline:
+    - uses: fetch
+      with:
+        uri: ${{source[0].uri}}
+
+    - runs: |
+        ./configure             \
+            --prefix=/usr       \
+            --docdir=/usr/share/doc/bison-3.8.2
+        touch aclocal.m4 Makefile.in
+        make -j$(nproc)
+
+install:
+  pipeline:
+    - uses: make-install
+
+test:
+  pipeline:
+    - runs: |
+        export BISON_PKGDATADIR=${{targets.destdir}}/usr/share/bison
+
+        ${{targets.destdir}}/usr/bin/bison --version
+
+        # yacc is a wrapper that calls /usr/bin/bison; symlink for test
+        ln -sf ${{targets.destdir}}/usr/bin/bison /usr/bin/bison
+        ${{targets.destdir}}/usr/bin/yacc --version
+        rm -f /usr/bin/bison
+
+        # Basic grammar parsing
+        cat > /tmp/calc.y << 'EOF'
+        %{
+        #include <stdio.h>
+        void yyerror(const char *s) {}
+        int yylex(void) { return 0; }
+        int main(void) { return 0; }
+        %}
+        %token NUMBER
+        %%
+        exp: NUMBER
+        %%
+        EOF
+        ${{targets.destdir}}/usr/bin/bison /tmp/calc.y
+
+        # -d flag produces header
+        ${{targets.destdir}}/usr/bin/bison -d /tmp/calc.y
+        test -f calc.tab.h
+
+        # yacc compat mode
+        ln -sf ${{targets.destdir}}/usr/bin/bison /usr/bin/bison
+        cat > /tmp/simple.y << 'EOF'
+        %token TOKEN
+        %%
+        start: TOKEN
+        %%
+        EOF
+        ${{targets.destdir}}/usr/bin/yacc /tmp/simple.y
+        rm -f /usr/bin/bison
+
+package:
+  depends:
+    - pkg:m4
+
+subpackages:
+  - name: bison-doc
+    description: "bison man pages and info"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p ${{targets.destdir}}/usr/share
+            if [ -d "${{targets.main_destdir}}/usr/share/man" ]; then
+              mv "${{targets.main_destdir}}/usr/share/man" \
+                 "${{targets.destdir}}/usr/share/man"
+            fi
+            if [ -d "${{targets.main_destdir}}/usr/share/info" ]; then
+              mv "${{targets.main_destdir}}/usr/share/info" \
+                 "${{targets.destdir}}/usr/share/info"
+              rm -f "${{targets.destdir}}/usr/share/info/dir"
+            fi
+            if [ -d "${{targets.main_destdir}}/usr/share/doc" ]; then
+              mv "${{targets.main_destdir}}/usr/share/doc" \
+                 "${{targets.destdir}}/usr/share/doc"
+            fi
+    test:
+      pipeline:
+        - runs: |
+            test -f ${{targets.destdir}}/usr/share/man/man1/bison.1
+    package:
+      depends:
+        - pkg:bison=${{package.full_version}}
+      triggers:
+        - install-info

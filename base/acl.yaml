@@ -1,0 +1,105 @@
+schema: 1
+name: acl
+version: "2.3.2"
+revision: 1
+description: "Utilities to administer Access Control Lists"
+license: LGPL-2.1-or-later AND GPL-2.0-or-later
+
+source:
+  - uri: https://download.savannah.gnu.org/releases/acl/acl-2.3.2.tar.xz
+    sha256: 97203a72cae99ab89a067fe2210c1cbf052bc492b479eca7d226d9830883b0bd
+    strip_components: 1
+
+build:
+  environment:
+    packages:
+      - pkg:bbi
+      - pkg:attr
+      - pkg:attr-dev
+      - pkg:autoconf
+  pipeline:
+    - uses: fetch
+      with:
+        uri: ${{source[0].uri}}
+
+    - runs: |
+        ./configure          \
+            --prefix=/usr    \
+            --disable-static \
+            --docdir=/usr/share/doc/acl-${{package.version}}
+
+        make -j$(nproc)
+
+install:
+  pipeline:
+    - uses: make-install
+
+test:
+  pipeline:
+    - runs: |
+        getfacl --version
+        setfacl --version
+
+        touch /tmp/acl_test
+        setfacl -m u:root:r /tmp/acl_test
+        getfacl /tmp/acl_test | grep -q "user:root:r--"
+
+package:
+  depends:
+    - pkg:attr
+  triggers:
+    - ldconfig
+
+subpackages:
+  - name: acl-dev
+    description: "acl development headers, pkg-config, and linker stub"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p ${{targets.destdir}}/usr/include
+            mkdir -p ${{targets.destdir}}/usr/lib
+
+            if [ -d "${{targets.main_destdir}}/usr/include/acl" ]; then
+              mv ${{targets.main_destdir}}/usr/include/acl \
+                 ${{targets.destdir}}/usr/include/acl
+            fi
+
+            if [ -d "${{targets.main_destdir}}/usr/lib/pkgconfig" ]; then
+              mv ${{targets.main_destdir}}/usr/lib/pkgconfig \
+                 ${{targets.destdir}}/usr/lib/pkgconfig
+            fi
+
+            if [ -e "${{targets.main_destdir}}/usr/lib/libacl.so" ]; then
+              mv ${{targets.main_destdir}}/usr/lib/libacl.so \
+                 ${{targets.destdir}}/usr/lib/libacl.so
+            fi
+    test:
+      pipeline:
+        - runs: |
+            test -d ${{targets.destdir}}/usr/include/acl
+            test -f ${{targets.destdir}}/usr/include/acl/libacl.h
+    package:
+      depends:
+        - pkg:acl=${{package.full_version}}
+
+  - name: acl-doc
+    description: "acl man pages and documentation"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p ${{targets.destdir}}/usr/share
+            if [ -d "${{targets.main_destdir}}/usr/share/man" ]; then
+              mv ${{targets.main_destdir}}/usr/share/man \
+                 ${{targets.destdir}}/usr/share/man
+            fi
+            if [ -d "${{targets.main_destdir}}/usr/share/doc" ]; then
+              mv ${{targets.main_destdir}}/usr/share/doc \
+                 ${{targets.destdir}}/usr/share/doc
+            fi
+    test:
+      pipeline:
+        - runs: |
+            test -f ${{targets.destdir}}/usr/share/man/man1/getfacl.1
+    package:
+      depends:
+        - pkg:acl=${{package.full_version}}

@@ -1,0 +1,267 @@
+schema: 1
+name: dracut
+version: "059"
+revision: 9
+description: "Event-driven initramfs infrastructure"
+license: GPL-2.0-or-later
+
+source:
+  - uri: https://github.com/dracutdevs/dracut/archive/refs/tags/059.tar.gz
+    sha256: eabf0bb685420c1e1d5475b6855ef787104508f0135ff570312845256e0fcecf
+    strip_components: 1
+
+build:
+  environment:
+    packages:
+      - pkg:bbi
+      - pkg:kmod-dev
+      - pkg:zlib-dev
+      - pkg:zstd-dev
+      - pkg:xz-dev
+      - pkg:openssl-dev
+  pipeline:
+    - uses: fetch
+      with:
+        uri: ${{source[0].uri}}
+
+    - runs: |
+        # Set up compiler environment
+        export CC=gcc
+        export PKG_CONFIG=pkgconf
+        export CFLAGS="-I/usr/include"
+        export CPPFLAGS="-I/usr/include"
+
+        # Configure dracut
+        # --systemdsystemunitdir: Install systemd units
+        # --bashcompletiondir: Install bash completion
+        # --disable-documentation: Skip man page generation (needs asciidoc)
+        ./configure \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --systemdsystemunitdir=/usr/lib/systemd/system \
+            --bashcompletiondir=/usr/share/bash-completion/completions \
+            --libdir=/usr/lib \
+            --disable-documentation
+
+        make -j$(nproc)
+
+install:
+  pipeline:
+    - uses: make-install
+
+    - runs: |
+        # Remove empty /var/lib/dracut/overlay if present
+        if [ -d "${{targets.destdir}}/var/lib/dracut/overlay" ]; then
+          rmdir "${{targets.destdir}}/var/lib/dracut/overlay"
+        fi
+
+        # Dracut 059 predates systemd v256 which introduced systemd-executor.
+        # The 00systemd module-setup.sh never lists it, so any initramfs built
+        # against systemd v256+ is missing this binary. systemd's manager_new()
+        # checks for the executor path at startup and returns ENOENT if absent,
+        # which manifests as "Failed to allocate manager object: No such file or
+        # directory" - the system then hangs with no further output.
+        # Force-include it in every initramfs via dracut.conf.d.
+        install -d "${{targets.destdir}}/usr/lib/dracut/dracut.conf.d"
+        printf 'install_items+=" /usr/lib/systemd/systemd-executor "\n' \
+            > "${{targets.destdir}}/usr/lib/dracut/dracut.conf.d/00-systemd-executor.conf"
+
+        # Add 00hookdir-rw dracut module.
+        #
+        # In a merged-usr initramfs (/lib -> usr/lib), systemd makes /usr
+        # read-only at startup before any dracut services run (~0.986 s on
+        # real hardware). dracut 059 writes runtime hook files to
+        # /lib/dracut/hooks/initqueue/{finished,settled,...} at pre-udev
+        # time; those writes fail with EROFS. With no finished hooks,
+        # check_finished sees an unexpanded glob and returns 0 immediately,
+        # so dracut-initqueue exits before dmsquash-live-root.sh ever runs.
+        #
+        # Fix: install a pre-udev hook numbered 00 (runs before all others)
+        # that mounts a tmpfs over /lib/dracut/hooks/initqueue (and
+        # /lib/dracut/hooks/emergency) so subsequent writes succeed.
+        # Mounting a tmpfs over a path on a read-only filesystem is legal -
+        # the mount call itself does not require the underlying fs to be rw.
+        install -d "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw"
+
+        printf '#!/bin/bash\n' \
+            > "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        printf 'check()   { return 0; }\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        printf 'depends() { echo base; }\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        # Install in both cmdline and pre-udev: systemd runs each as a separate
+        # service with its own mount namespace, so the tmpfs must be mounted
+        # independently in each stage. cmdline is earliest (parse-dmsquash-live
+        # calls wait_for_dev there); pre-udev covers genrules.
+        printf 'install() {\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        printf '    inst_hook cmdline  00 "$moddir/hookdir-rw.sh"\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        printf '    inst_hook pre-udev 00 "$moddir/hookdir-rw.sh"\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        printf '}\n' \
+            >> "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+        chmod 755 "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh"
+
+        {
+            printf '#!/bin/sh\n'
+            printf '# Shadow /lib/dracut/hooks/{initqueue,emergency} with a tmpfs so\n'
+            printf '# dracut can write runtime hook files. Required in merged-usr\n'
+            printf '# initramfs where systemd makes /usr read-only before dracut\n'
+            printf '# services run (dracut 059 + systemd 256+).\n'
+            printf '\n'
+            printf 'type warn > /dev/null 2>&1 || . /lib/dracut-lib.sh\n'
+            printf '\n'
+            printf 'make_writable_hookdir() {\n'
+            printf '    local dir="/lib/dracut/hooks/$1"\n'
+            printf '    mkdir -p "$dir"\n'
+            printf '    # mountpoint(1) is not guaranteed in initramfs; use /proc/mounts.\n'
+            printf '    if grep -q " $dir tmpfs " /proc/mounts 2>/dev/null; then\n'
+            printf '        return 0\n'
+            printf '    fi\n'
+            printf '    mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs "$dir" || return 1\n'
+            printf '}\n'
+            printf '\n'
+            printf 'make_writable_hookdir initqueue || warn "hookdir-rw: failed to mount tmpfs on /lib/dracut/hooks/initqueue"\n'
+            printf 'mkdir -p \\\n'
+            printf '    /lib/dracut/hooks/initqueue/finished \\\n'
+            printf '    /lib/dracut/hooks/initqueue/settled \\\n'
+            printf '    /lib/dracut/hooks/initqueue/online \\\n'
+            printf '    /lib/dracut/hooks/initqueue/timeout\n'
+            printf '\n'
+            printf 'make_writable_hookdir emergency || warn "hookdir-rw: failed to mount tmpfs on /lib/dracut/hooks/emergency"\n'
+        } > "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/hookdir-rw.sh"
+        chmod 755 "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/hookdir-rw.sh"
+
+        # Auto-include the module in every initramfs built with this dracut.
+        # Module name is the directory name WITHOUT the two-digit numeric prefix:
+        # 00hookdir-rw/ -> "hookdir-rw". Trailing space satisfies dracut's += parser.
+        printf 'add_dracutmodules+=" hookdir-rw "\n' \
+            > "${{targets.destdir}}/usr/lib/dracut/dracut.conf.d/01-hookdir-rw.conf"
+
+    - runs: |
+        # Patch 30-dmsquash-live-genrules.sh to also call wait_for_dev for
+        # /dev/root in the pre-udev stage.
+        #
+        # Problem: dracut-cmdline and dracut-initqueue run in separate mount
+        # namespaces. The wait_for_dev -n /dev/root call in cmdline's
+        # 30-parse-dmsquash-live.sh writes devexists-/dev/root.sh to cmdline's
+        # tmpfs, which is invisible to dracut-initqueue. dracut-initqueue only
+        # sees the pre-udev tmpfs (where devexists-MONTEVERDE_LIVE.sh lives).
+        #
+        # Consequence: check_finished() sees only one finished hook
+        # (devexists-MONTEVERDE_LIVE.sh). The moment the CD-ROM label symlink
+        # appears, check_finished returns 0 and the initqueue loop breaks -
+        # before the settled queue (dmsquash-live-root) is ever processed.
+        # dmsquash-live-root never runs, /dev/root is never created, and the
+        # generator's sysroot.mount unit keeps waiting for /dev/mapper/live-rw.
+        #
+        # Fix: add wait_for_dev -n /dev/root to 30-dmsquash-live-genrules.sh
+        # (a pre-udev hook). Its write lands in the pre-udev tmpfs - the same
+        # one dracut-initqueue can see. Now check_finished only passes after
+        # both conditions are true:
+        #   1. /dev/disk/by-label/MONTEVERDE_LIVE exists   (CD visible)
+        #   2. /dev/root exists                            (dmsquash-live-root ran)
+        # This forces the settled queue to be processed and dmsquash-live-root
+        # to run. dmsquash-live-root then creates ln -s null /dev/root, triggers
+        # systemctl daemon-reload with :>/xor_overlayfs (switching sysroot.mount
+        # from device-mapper to overlayfs), and boot proceeds normally.
+        # Note: the source file is dmsquash-live-genrules.sh (no numeric prefix).
+        # The 30- prefix is added by inst_hook when dracut builds the initramfs.
+        genrules="${{targets.destdir}}/usr/lib/dracut/modules.d/90dmsquash-live/dmsquash-live-genrules.sh"
+        sed -i '/wait_for_dev -n "\${root#live:}"/a\        wait_for_dev -n /dev/root' \
+            "$genrules"
+        grep -q 'wait_for_dev -n /dev/root' "$genrules" || \
+            { echo "FAIL: genrules patch did not apply"; exit 1; }
+
+test:
+  pipeline:
+    - runs: |
+        test -x "${{targets.destdir}}/usr/bin/dracut" || \
+          { echo "FAIL: dracut binary not found"; exit 1; }
+
+        test -d "${{targets.destdir}}/usr/lib/dracut/modules.d" || \
+          { echo "FAIL: dracut modules directory missing"; exit 1; }
+
+        module_count=$(find "${{targets.destdir}}/usr/lib/dracut/modules.d" -mindepth 1 -maxdepth 1 -type d | wc -l)
+        test "$module_count" -gt 0 || \
+          { echo "FAIL: no dracut modules found"; exit 1; }
+
+        echo "✓ dracut binary and modules present ($module_count modules)"
+
+        grep -q 'systemd-executor' \
+          "${{targets.destdir}}/usr/lib/dracut/dracut.conf.d/00-systemd-executor.conf" || \
+          { echo "FAIL: systemd-executor install_items missing"; exit 1; }
+
+        test -x "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/module-setup.sh" || \
+          { echo "FAIL: 00hookdir-rw/module-setup.sh missing or not executable"; exit 1; }
+        test -x "${{targets.destdir}}/usr/lib/dracut/modules.d/00hookdir-rw/hookdir-rw.sh" || \
+          { echo "FAIL: 00hookdir-rw/hookdir-rw.sh missing or not executable"; exit 1; }
+        grep -q 'add_dracutmodules.*hookdir-rw' \
+          "${{targets.destdir}}/usr/lib/dracut/dracut.conf.d/01-hookdir-rw.conf" || \
+          { echo "FAIL: 01-hookdir-rw.conf missing or does not reference hookdir-rw"; exit 1; }
+
+        grep -q 'wait_for_dev -n /dev/root' \
+          "${{targets.destdir}}/usr/lib/dracut/modules.d/90dmsquash-live/dmsquash-live-genrules.sh" || \
+          { echo "FAIL: genrules missing wait_for_dev -n /dev/root"; exit 1; }
+
+        echo "✓ dracut tests passed"
+
+package:
+  depends:
+    # dracut is script-heavy; explicit deps needed for invoked commands
+    - cmd:bash
+    - cmd:kmod
+    - cmd:find
+    - cmd:grep
+    - cmd:sed
+
+subpackages:
+  - name: dracut-network
+    description: "dracut network modules for NFS, iSCSI, and network boot"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p "${{targets.destdir}}/usr/lib/dracut/modules.d"
+
+            for mod in 35network-legacy 40network 45ifcfg 90livenet \
+                       95fcoe 95iscsi 95nfs 95nbd 95ssh-client; do
+              if [ -d "${{targets.main_destdir}}/usr/lib/dracut/modules.d/$mod" ]; then
+                mv "${{targets.main_destdir}}/usr/lib/dracut/modules.d/$mod" \
+                   "${{targets.destdir}}/usr/lib/dracut/modules.d/$mod"
+              fi
+            done
+    test:
+      pipeline:
+        - runs: |
+            test -d "${{targets.destdir}}/usr/lib/dracut/modules.d/40network" || \
+            test -d "${{targets.destdir}}/usr/lib/dracut/modules.d/95nfs" || \
+              { echo "FAIL: no network modules found"; exit 1; }
+    package:
+      depends:
+        - pkg:dracut=${{package.full_version}}
+
+  - name: dracut-tools
+    description: "dracut helper tools and utilities"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p "${{targets.destdir}}/usr/bin"
+            mkdir -p "${{targets.destdir}}/usr/lib/dracut"
+
+            if [ -f "${{targets.main_destdir}}/usr/bin/lsinitrd" ]; then
+              mv "${{targets.main_destdir}}/usr/bin/lsinitrd" \
+                 "${{targets.destdir}}/usr/bin/lsinitrd"
+            fi
+
+            # dracut-install stays in the main dracut package (it is a core
+            # runtime helper, not a user-facing tool)
+    test:
+      pipeline:
+        - runs: |
+            test -x "${{targets.destdir}}/usr/bin/lsinitrd" || \
+              { echo "FAIL: lsinitrd not found"; exit 1; }
+    package:
+      depends:
+        - pkg:dracut=${{package.full_version}}
+
