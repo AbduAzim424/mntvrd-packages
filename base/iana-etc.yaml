@@ -1,0 +1,35 @@
+schema: 1
+name: iana-etc
+version: "20260306"
+revision: 1
+description: "IANA /etc/protocols and /etc/services data files"
+license: LicenseRef-iana-etc
+
+source:
+  - uri: https://github.com/Mic92/iana-etc/releases/download/20260306/iana-etc-20260306.tar.gz
+    sha256: a1398484a3b2d0803e342ce18aee42f3f56fd904ebccbeae8774fbdb7f4d8acb
+    strip_components: 1
+
+build:
+  environment:
+    packages:
+      - pkg:bbi
+
+  pipeline:
+    - uses: fetch
+      with:
+        uri: ${{source[0].uri}}
+
+install:
+  pipeline:
+    - runs: |
+        install -D -m 644 services  ${{targets.destdir}}/etc/services
+        install -D -m 644 protocols ${{targets.destdir}}/etc/protocols
+
+test:
+  pipeline:
+    - runs: |
+        test -f ${{targets.destdir}}/etc/services
+        test -f ${{targets.destdir}}/etc/protocols
+        grep -q "^tcp" ${{targets.destdir}}/etc/protocols
+        grep -q "^http" ${{targets.destdir}}/etc/services

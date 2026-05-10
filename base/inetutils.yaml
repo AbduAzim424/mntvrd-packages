@@ -1,0 +1,99 @@
+schema: 1
+name: inetutils
+version: "2.7"
+revision: 1
+description: "GNU basic networking utilities"
+license: GPL-3.0-or-later
+
+source:
+  - uri: https://ftpmirror.gnu.org/gnu/inetutils/inetutils-2.7.tar.gz
+    sha256: a156be1cde3c5c0ffefc262180d9369a60484087907aa554c62787d2f40ec086
+    strip_components: 1
+
+build:
+  environment:
+    packages:
+      - pkg:bbi
+      - pkg:ncurses-dev
+      - pkg:automake
+      - pkg:autoconf
+      - pkg:gettext-dev
+      - pkg:texinfo
+
+  pipeline:
+    - uses: fetch
+      with:
+        uri: ${{source[0].uri}}
+
+    - runs: |
+        # Fix build with gcc-14.1+
+        sed -i 's/def HAVE_TERMCAP_TGETENT/ 1/' telnet/telnet.c
+
+        # Prevent autotools from trying to regenerate files
+        find . \( -name 'aclocal.m4' -o -name 'Makefile.in' -o -name 'configure' -o -name 'config.h.in' \) \
+            | xargs -r touch
+        find man -name '*.1' | xargs touch
+
+        ./configure             \
+            --prefix=/usr       \
+            --bindir=/usr/bin   \
+            --localstatedir=/var \
+            --disable-logger    \
+            --disable-whois     \
+            --disable-rcp       \
+            --disable-rexec     \
+            --disable-rlogin    \
+            --disable-rsh       \
+            --disable-servers
+
+        make -j$(nproc)
+
+install:
+  pipeline:
+    - uses: make-install
+
+    - runs: |
+        # ifconfig belongs in sbin
+        mkdir -p ${{targets.destdir}}/usr/sbin
+        mv ${{targets.destdir}}/usr/bin/ifconfig \
+           ${{targets.destdir}}/usr/sbin/ifconfig
+
+test:
+  pipeline:
+    - runs: |
+        ${{targets.destdir}}/usr/bin/hostname   --version
+        ${{targets.destdir}}/usr/bin/ping       --version
+        ${{targets.destdir}}/usr/bin/traceroute --version
+        test -f ${{targets.destdir}}/usr/bin/ftp
+        test -f ${{targets.destdir}}/usr/bin/telnet
+        test -f ${{targets.destdir}}/usr/sbin/ifconfig
+
+subpackages:
+  - name: inetutils-doc
+    description: "inetutils man pages"
+    install:
+      pipeline:
+        - runs: |
+            mkdir -p ${{targets.destdir}}/usr/share
+            if [ -d "${{targets.main_destdir}}/usr/share/man" ]; then
+              mv "${{targets.main_destdir}}/usr/share/man" \
+                 "${{targets.destdir}}/usr/share/man"
+            fi
+            if [ -d "${{targets.main_destdir}}/usr/share/doc" ]; then
+              mv "${{targets.main_destdir}}/usr/share/doc" \
+                 "${{targets.destdir}}/usr/share/doc"
+            fi
+            if [ -d "${{targets.main_destdir}}/usr/share/info" ]; then
+              mv "${{targets.main_destdir}}/usr/share/info" \
+                 "${{targets.destdir}}/usr/share/info"
+              rm -f "${{targets.destdir}}/usr/share/info/dir"
+            fi
+    test:
+      pipeline:
+        - runs: |
+            test -f ${{targets.destdir}}/usr/share/man/man1/ping.1
+    package:
+      triggers:
+        - install-info
+      depends:
+        - pkg:inetutils=${{package.full_version}}
